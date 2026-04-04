@@ -1,0 +1,25 @@
+# Classes
+AdditiveHW	KEYWORD1
+HWParams	KEYWORD1
+HWForecast	KEYWORD1
+
+# Methods
+begin	KEYWORD2
+update	KEYWORD2
+forecast	KEYWORD2
+forecastPI	KEYWORD2
+processRefit	KEYWORD2
+deferRefit	KEYWORD2
+refitPending	KEYWORD2
+isReady	KEYWORD2
+fitted	KEYWORD2
+residual	KEYWORD2
+level	KEYWORD2
+trend	KEYWORD2
+sigma2	KEYWORD2
+seasonLen	KEYWORD2
+smoothing	KEYWORD2
+
+# Constants
+MAX_SEASON	LITERAL1
+MAX_WINDOW	LITERAL1
