@@ -68,7 +68,7 @@ src/
 
 examples/
   zephyr/                 Zephyr — k_msgq + forecast
-  zephyr_ble/             Zephyr BLE — GATT write + notify (mutex-protected)
+  zephyr_ble/             Zephyr BLE — GATT write + notify (UTF-8 strings, mutex-protected)
   Uno_BasicForecast/      Arduino Uno — immediate mode
   Uno_DeferredRefit/      Arduino Uno — deferred refit with timing
   Uno_RTC_HourlyForecast/ Arduino Uno — DS3231 + hourly aggregation
@@ -97,6 +97,17 @@ west build -b bbc_microbit_v2               # micro:bit v2
 ```
 
 See `examples/zephyr/` for basic usage, `examples/zephyr_ble/` for BLE.
+
+### Testing the BLE example
+
+The BLE example uses human-readable UTF-8 strings — no hex conversion needed.
+
+1. Install **nRF Connect** on your phone (iOS / Android).
+2. Scan and connect to **"AHW-Forecast"**.
+3. On characteristic `12340001`, select **UTF-8**, type a number (e.g. `23.6`), tap Write.
+4. On characteristic `12340002`, enable notifications and set display to **UTF-8**.
+5. After 24 observations the forecast appears as: `fc=23.4 lo=19.1 hi=27.8`
+   (before that you'll see `waiting for data...`).
 
 ```c
 #include "additive_hw_api.h"

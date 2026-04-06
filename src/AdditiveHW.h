@@ -36,8 +36,8 @@
 #ifdef ARDUINO
   #include <Arduino.h>
 #else
-  #include <cstring>
-  #include <cstdint>
+  #include <string.h>
+  #include <stdint.h>
 #endif
 #include <math.h>
 
