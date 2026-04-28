@@ -46,7 +46,7 @@ HWForecast f = hw.forecastPI(1);  // one step ahead
 - **Automatic parameter refit** via coordinate-descent optimizer
 - **Prediction intervals** — exact ETS(A,A,A) variance formula (Hyndman et al. 2008)
 - **Deferred refit** — update() stays O(1); optimizer runs when you have time
-- **~736 B RAM** (on AVR; actual layout varies by platform) — fits on nRF52840 and even Arduino Uno
+- **~1.7 KB RAM** (on AVR; actual layout varies by platform) — fits on nRF52840 and Arduino Uno
 - **No dependencies** — header-only core, no STL, no dynamic allocation, no RTOS required
 
 ## Supported Platforms
@@ -72,6 +72,7 @@ examples/
   Uno_BasicForecast/      Arduino Uno — immediate mode
   Uno_DeferredRefit/      Arduino Uno — deferred refit with timing
   Uno_RTC_HourlyForecast/ Arduino Uno — DS3231 + hourly aggregation
+  Uno_SyntheticTest/      Arduino Uno — deterministic 72-sample bench, no hardware
 
 test_additive_hw.cpp      Host test suite (128 tests, g++ -std=c++11)
 ```
@@ -171,7 +172,7 @@ void loop() {
 
 | Function | Description |
 |----------|-------------|
-| `ahw_init(season_len, defer)` | Initialise model |
+| `ahw_init(season_len, defer)` | Initialise model. Returns `bool` — `false` if `season_len` was clamped to `MAX_SEASON`. |
 | `ahw_update(y)` | Feed one observation (O(1) when deferred) |
 | `ahw_process()` | Run pending refit. Returns `true` if work done |
 | `ahw_forecast(h, &f)` | h-step-ahead forecast + 95% PI. Returns `true` if ready |
@@ -184,7 +185,7 @@ void loop() {
 
 | Method | Description |
 |--------|-------------|
-| `begin(seasonLen, window, refitEvery, α, β, γ)` | Configure model |
+| `begin(seasonLen, window, refitEvery, α, β, γ)` | Configure model. Returns `bool` — `false` if any argument was clamped (e.g. `seasonLen > MAX_SEASON`, α/β/γ outside `[0, 1]`). |
 | `deferRefit(bool)` | Enable/disable deferred mode |
 | `update(y)` | Feed one observation |
 | `processRefit()` | Run pending refit |
@@ -196,19 +197,45 @@ void loop() {
 | `sigma2()` | Residual variance |
 | `smoothing()` | Current α, β, γ as `HWParams` |
 
+## Profiling (optional)
+
+Compile with `-DAHW_INSTRUMENT` to enable a lightweight RAII tracer on
+the four hot paths.  Zero cost (every macro is `((void)0)`) when undefined.
+
+```cpp
+#include <AdditiveHW.h>
+
+// ... after some updates ...
+Serial.print(F("refit ticks=")); Serial.print(AHW_TRACE_GET(AHW_SLOT_REFIT));
+Serial.print(F(" hits="));        Serial.println(AHW_TRACE_COUNT(AHW_SLOT_REFIT));
+AHW_TRACE_RESET();
+```
+
+Slots: `AHW_SLOT_ONLINE`, `AHW_SLOT_REFIT`, `AHW_SLOT_OPTIMIZE`, `AHW_SLOT_MSE`.
+
+Time source picked automatically: Cortex-M `DWT->CYCCNT` (define
+`AHW_TRACE_USE_DWT` first), Arduino `micros()`, x86_64 `__rdtsc()`,
+or `std::chrono::steady_clock` ns elsewhere.
+
 ## Limitations
 
 - **Season length** — `MAX_SEASON` defaults to 24.  You can increase it by editing
-  the constant in `AdditiveHW.h`.  `MAX_WINDOW` (= 3 × `MAX_SEASON`) and the
-  `computeMSE` stack frame scale with it.  Approximate RAM usage:
+  the constant in `AdditiveHW.h`.  `MAX_WINDOW` is a power of two so ring
+  wraps are a single AND; bump it (also to a power of two) when raising
+  `MAX_SEASON` past 32 so that `MAX_WINDOW ≥ 3·MAX_SEASON`.  Approximate
+  RAM usage:
 
-  | `MAX_SEASON` | `sizeof` (approx) | Stack (refit) | Arduino Uno? |
-  |-------------:|------------------:|--------------:|:-------------|
-  |           24 |            752 B  |         96 B  | Yes (default) |
-  |           32 |            976 B  |        128 B  | Yes          |
-  |           48 |          1.4 KB   |        192 B  | Tight        |
-  |           96 |          2.8 KB   |        384 B  | No — use Cortex-M |
-  |          168 |          4.8 KB   |        672 B  | No — use Cortex-M |
+  | `MAX_SEASON` | `MAX_WINDOW` | `sizeof` (approx) | Stack (refit) | Arduino Uno? |
+  |-------------:|-------------:|------------------:|--------------:|:-------------|
+  |           24 |          128 |          1.7 KB   |         ~80 B | Yes (default) |
+  |           32 |          128 |          1.9 KB   |         ~80 B | Tight |
+  |           48 |          256 |          3.4 KB   |         ~80 B | No — use Cortex-M |
+  |           96 |          512 |          6.5 KB   |         ~80 B | No — use Cortex-M |
+  |          168 |          512 |          8.2 KB   |         ~80 B | No — use Cortex-M |
+
+  Refit-time stack frame is nearly constant: the seasonal scratch used
+  by `computeMSE` was lifted to a class member, so coord-descent no
+  longer allocates `MAX_SEASON × 4 B` on every call.
 
   On Zephyr / nRF52840 / any Cortex-M with ≥ 16 KB RAM, values up to 168 or
   higher work fine.  On Arduino Uno (2 KB SRAM), keep `MAX_SEASON` ≤ 32.

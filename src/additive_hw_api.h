@@ -33,11 +33,17 @@ typedef struct {
 /**
  * Initialise the forecast model.
  *
- * @param season_len  Seasonal period (1–24).
+ * @param season_len  Seasonal period (1–MAX_SEASON; clamped if out of range).
  * @param defer_refit true = update() is always O(1); call ahw_process() to refit.
  *                    false = update() runs the optimizer inline when due.
+ *
+ * @return true if season_len was accepted as given, false if it was
+ *         clamped.  When false, query the actual configured period via
+ *         the C++ AdditiveHW::seasonLen() accessor (or rebuild with a
+ *         valid value).  Existing callers that ignore the return get
+ *         the prior silent-clamp behaviour.
  */
-void ahw_init(int season_len, bool defer_refit);
+bool ahw_init(int season_len, bool defer_refit);
 
 /**
  * Feed one new observation.

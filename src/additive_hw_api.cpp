@@ -10,9 +10,10 @@ static AdditiveHW s_hw;
 
 extern "C" {
 
-void ahw_init(int season_len, bool defer_refit) {
-    s_hw.begin(season_len);
+bool ahw_init(int season_len, bool defer_refit) {
+    bool ok = s_hw.begin(season_len);
     s_hw.deferRefit(defer_refit);
+    return ok;
 }
 
 void ahw_update(float y) {

@@ -28,9 +28,19 @@
 //    you call from loop() when you have time.  Forecasts remain valid
 //    (with old parameters) while a refit is pending.
 //
-//  RAM budget  (MAX_SEASON = 24, MAX_WINDOW = 72):
-//    ring[]     288 B     scratch[]  288 B     s[]  96 B
-//    scalars    ~64 B     Total     ~736 B     (Arduino Uno: 2 KB SRAM)
+//  RAM budget  (MAX_SEASON = 24, MAX_WINDOW = 128):
+//    ring[]            512 B   scratch[]         512 B
+//    s[] state          96 B   seasonScratch[]    96 B
+//    varTable[]        384 B   scalars           ~76 B
+//    Total           ~1676 B   (Arduino Uno: 2 KB SRAM, ~82% used)
+//
+//  MAX_WINDOW is a power of two so ring wraps are a single AND
+//  (`& windowMask_`) instead of a software-divide on AVR.  The
+//  effective window is rounded UP to the next power of two in begin().
+//  varTable[] precomputes the cumulative-sum variance multiplier
+//  so forecastPI(h) is an O(1) lookup.  seasonScratch[] is the
+//  lifted MSE seasonal buffer — keeps coord descent off the stack
+//  across ~240 calls per refit.
 
 // ── Platform ─────────────────────────────────────────────────────────
 #ifdef ARDUINO
@@ -40,6 +50,7 @@
   #include <stdint.h>
 #endif
 #include <math.h>
+#include "ahw_trace.h"
 
 #ifndef constrain
   #define constrain(x, lo, hi) ((x)<(lo)?(lo):((x)>(hi)?(hi):(x)))
@@ -76,35 +87,76 @@ struct HWForecast {
     float sigma;   // forecast std dev  σ_h
 };
 
+// ── Compile-time helper ──────────────────────────────────────────────
+//   next_pow2(n) rounds n up to the nearest power of two so MAX_WINDOW
+//   can be derived from MAX_SEASON instead of hand-tuned.
+namespace ahw_detail_ {
+    constexpr int next_pow2(int n, int p = 1) {
+        return p >= n ? p : next_pow2(n, p << 1);
+    }
+}
+
 // ── Main class ───────────────────────────────────────────────────────
 
 class AdditiveHW {
 public:
     static const int MAX_SEASON = 24;
-    static const int MAX_WINDOW = 3 * MAX_SEASON;   // 72
+    static const int MAX_WINDOW = ahw_detail_::next_pow2(3 * MAX_SEASON);
+    static_assert((MAX_WINDOW & (MAX_WINDOW - 1)) == 0,
+                  "MAX_WINDOW must be a power of two for bitmask wrap");
+    static_assert(MAX_WINDOW >= 2 * MAX_SEASON + 1,
+                  "MAX_WINDOW must be ≥ 2·MAX_SEASON+1 for bootstrap");
 
     AdditiveHW() { begin(12); }
 
     /// (Re)configure the model.
     ///   seasonLen  – seasonal period       (1 … MAX_SEASON)
-    ///   window     – ring size for refit;  0 → 3 × seasonLen
+    ///   window     – ring size for refit;  0 → 3 × seasonLen.
+    ///                Rounded UP to the next power of two so wraps are a
+    ///                single AND.  Effective window may exceed the request.
     ///   refitEvery – refit period in obs;  0 → seasonLen
-    void begin(int   seasonLen,
+    ///
+    /// Returns true if all arguments were accepted as given, false if any
+    /// were clamped to a valid range (seasonLen outside 1…MAX_SEASON,
+    /// window outside 2·m+1…MAX_WINDOW, refitEvery negative, or α/β/γ
+    /// outside [0, 1]).  Power-of-two rounding of `window` is by design
+    /// and does NOT count as a clamp.
+    bool begin(int   seasonLen,
                int   window     = 0,
                int   refitEvery = 0,
                float alpha      = 0.20f,
                float beta       = 0.05f,
                float gamma      = 0.10f)
     {
+        bool ok = true;
+
+        if (seasonLen < 1 || seasonLen > MAX_SEASON) ok = false;
         m_          = constrain(seasonLen, 1, MAX_SEASON);
-        window_     = constrain(window <= 0 ? 3 * m_ : window,
-                                2 * m_ + 1, MAX_WINDOW);
+
+        int reqW = window <= 0 ? 3 * m_ : window;
+        if (window > 0 && (window < 2 * m_ + 1 || window > MAX_WINDOW)) ok = false;
+        int w = constrain(reqW, 2 * m_ + 1, MAX_WINDOW);
+        // Round up to the next power of two (≤ MAX_WINDOW, also a pow2).
+        int p = 1;
+        while (p < w) p <<= 1;
+        if (p > MAX_WINDOW) p = MAX_WINDOW;
+        window_     = p;
+        windowMask_ = window_ - 1;
+
+        if (refitEvery < 0) ok = false;
         refitEvery_ = refitEvery <= 0 ? m_ : max(1, refitEvery);
+
+        if (alpha < 0.0f || alpha > 1.0f) ok = false;
+        if (beta  < 0.0f || beta  > 1.0f) ok = false;
+        if (gamma < 0.0f || gamma > 1.0f) ok = false;
         alpha_      = clamp01(alpha);
         beta_       = clamp01(beta);
         gamma_      = clamp01(gamma);
+
         deferred_   = false;
         reset();
+        rebuildVarTable();
+        return ok;
     }
 
     /// Enable or disable deferred refit mode.
@@ -144,6 +196,9 @@ public:
     bool refitPending() const { return refitPending_; }
 
     /// Point forecast, h steps ahead  (h ≥ 1).
+    /// Note: uses the *configured* seasonLen() — if begin() was called
+    /// with seasonLen > MAX_SEASON, that argument was silently clamped.
+    /// Check begin()'s return or seasonLen() to detect this.
     float forecast(int h = 1) const {
         h = max(h, 1);
         if (!ready_) return ringN_ > 0 ? ringMean() : 0.0f;
@@ -181,14 +236,14 @@ public:
     HWParams smoothing()  const { return { alpha_, beta_, gamma_ }; }
 
     /// One-step residual variance  σ² (unbiased, n−1 denominator).
-    float sigma2() const {
-        return nResid_ > 1 ? resM2_ / (float)(nResid_ - 1) : 0.0f;
-    }
+    /// Cached after every welfordPush; getter is a single load.
+    float sigma2() const { return sigma2Cached_; }
 
 private:
     // ── Config ───────────────────────────────────────────────────────
     int   m_;
     int   window_;
+    int   windowMask_;          // window_ - 1; valid because window_ is a power of two
     int   refitEvery_;
     float alpha_, beta_, gamma_;
     bool  deferred_;
@@ -200,26 +255,27 @@ private:
 
     void ringPush(float y) {
         if (ringN_ < window_) {
-            ring_[(ringHead_ + ringN_++) % window_] = y;
+            ring_[(ringHead_ + ringN_++) & windowMask_] = y;
+            ringSum_ += y;
         } else {
+            ringSum_ -= ring_[ringHead_];
             ring_[ringHead_] = y;
-            ringHead_ = (ringHead_ + 1) % window_;
+            ringSum_ += y;
+            ringHead_ = (ringHead_ + 1) & windowMask_;
         }
     }
 
     void ringCopyTo(float* dst) const {
         for (int i = 0; i < ringN_; ++i)
-            dst[i] = ring_[(ringHead_ + i) % window_];
+            dst[i] = ring_[(ringHead_ + i) & windowMask_];
     }
 
     float ringAt(int i) const {
-        return ring_[(ringHead_ + i) % window_];
+        return ring_[(ringHead_ + i) & windowMask_];
     }
 
     float ringMean() const {
-        float sum = 0.0f;
-        for (int i = 0; i < ringN_; ++i) sum += ringAt(i);
-        return sum / (float)ringN_;
+        return ringN_ > 0 ? ringSum_ / (float)ringN_ : 0.0f;
     }
 
     // ── Model state ──────────────────────────────────────────────────
@@ -238,7 +294,11 @@ private:
     float          resMean_;
     float          resM2_;
 
-    mutable float  scratch_[MAX_WINDOW];    // refit work buffer
+    mutable float  scratch_[MAX_WINDOW];        // refit work buffer
+    mutable float  seasonScratch_[MAX_SEASON];  // computeMSE seasonal scratch
+    float          ringSum_;                    // running Σ ring_[] for O(1) ringMean
+    float          sigma2Cached_;               // cached σ², refreshed in welfordPush
+    float          varTable_[4 * MAX_SEASON];   // Σ_{j=0}^{h−1} c_j² lookup, rebuilt on refit
 
     int sIdx(unsigned long t) const {
         return (int)(t % (unsigned long)m_);
@@ -249,23 +309,29 @@ private:
         nObs_     = 0;
         nResid_   = 0;
         resMean_  = resM2_ = 0.0f;
+        ringSum_  = 0.0f;
+        sigma2Cached_ = 0.0f;
         ready_    = false;
         refitPending_ = false;
         l_ = b_ = fitted_ = residual_ = 0.0f;
-        memset(s_,       0, sizeof(s_));
-        memset(ring_,    0, sizeof(ring_));
-        memset(scratch_, 0, sizeof(scratch_));
+        memset(s_,             0, sizeof(s_));
+        memset(ring_,          0, sizeof(ring_));
+        memset(scratch_,       0, sizeof(scratch_));
+        memset(seasonScratch_, 0, sizeof(seasonScratch_));
+        memset(varTable_,      0, sizeof(varTable_));
     }
 
     // ── Refit (optimize + rebuild) ───────────────────────────────────
     //  Rebuild overwrites fitted_/residual_ with in-sample replay values.
     //  We preserve the genuine online one-step prediction from onlineStep().
     void doRefit() {
+        AHW_TRACE(AHW_SLOT_REFIT);
         float saveFit = fitted_, saveRes = residual_;
 
         HWParams p = smoothing();
         optimizeParams(p);
         alpha_ = p.alpha;  beta_ = p.beta;  gamma_ = p.gamma;
+        rebuildVarTable();
         rebuildState();
 
         fitted_ = saveFit;  residual_ = saveRes;
@@ -296,31 +362,40 @@ private:
         resMean_ += d1 / (float)nResid_;
         float d2  = e - resMean_;
         resM2_   += d1 * d2;
+        sigma2Cached_ = nResid_ > 1 ? resM2_ / (float)(nResid_ - 1) : 0.0f;
     }
 
     // ── h-step variance multiplier ───────────────────────────────────
     //
     //   c_0 = 1,   c_j = α + α·β·j + γ·𝟙(j mod m = 0)
-    //   Returns  Σ_{j=0}^{h−1}  c_j²
+    //   varTable_[h−1] = Σ_{j=0}^{h−1}  c_j²
     //   Horizon is capped at 4·m to bound computation on small MCUs.
+    //   Table is rebuilt by rebuildVarTable() whenever α, β, γ, or m change.
     //
     float varMultiplier(int h) const {
         h = max(h, 1);
         int cap = 4 * m_;
         if (h > cap) h = cap;
+        return varTable_[h - 1];
+    }
+
+    void rebuildVarTable() {
+        int cap = 4 * m_;
         float sum = 1.0f;                          // c_0² = 1
-        for (int j = 1; j < h; ++j) {
+        varTable_[0] = sum;
+        for (int j = 1; j < cap; ++j) {
             float c = alpha_ + alpha_ * beta_ * (float)j;
             if (j % m_ == 0) c += gamma_;
             sum += c * c;
+            varTable_[j] = sum;
         }
-        return sum;
     }
 
     // ── Online step ──────────────────────────────────────────────────
     //  Genuine one-step-ahead prediction: compute forecast THEN update.
     //  Residuals feed into Welford for σ² estimation.
     void onlineStep(float y) {
+        AHW_TRACE(AHW_SLOT_ONLINE);
         if (!ready_) {
             if (ringN_ >= 2 * m_)
                 bootstrap(nObs_ - (unsigned long)ringN_);
@@ -392,8 +467,11 @@ private:
 
     // ── MSE objective  (static, pure) ────────────────────────────────
     //  phase = base % m  so that seasonal slots match rebuildState().
+    //  s    = caller-provided seasonal scratch of size ≥ m (lifted out
+    //         of the stack so coordinate descent reuses one buffer).
     static float computeMSE(const float* buf, int n, int m,
-                            const HWParams& p, int phase = 0) {
+                            const HWParams& p, int phase, float* s) {
+        AHW_TRACE(AHW_SLOT_MSE);
         if (n < 2 * m + 1) return 1e30f;
 
         float avg1 = 0.0f, avg2 = 0.0f;
@@ -403,7 +481,6 @@ private:
 
         float b = (avg2 - avg1) / (float)m;
         float l = avg2 + b * (float)(m - 1) * 0.5f;
-        float s[MAX_SEASON];
         for (int i = 0; i < m; ++i)
             s[(phase + i) % m] = 0.5f * ((buf[i] - avg1) + (buf[m + i] - avg2));
 
@@ -427,13 +504,14 @@ private:
 
     // ── Coordinate-descent optimizer ─────────────────────────────────
     void optimizeParams(HWParams& p) const {
+        AHW_TRACE(AHW_SLOT_OPTIMIZE);
         ringCopyTo(scratch_);
 
         int phase = (int)((nObs_ - (unsigned long)ringN_) % (unsigned long)m_);
 
         float step[3]      = { 0.05f, 0.03f, 0.05f };
         bool  converged[3] = { false, false, false };
-        float bestMSE      = computeMSE(scratch_, ringN_, m_, p, phase);
+        float bestMSE      = computeMSE(scratch_, ringN_, m_, p, phase, seasonScratch_);
 
         for (int iter = 0; iter < 40; ++iter) {
             bool anyActive = false;
@@ -447,7 +525,7 @@ private:
 
                 for (int dir = -1; dir <= 1; dir += 2) {
                     p.ref(k) = clamp01(orig + (float)dir * step[k]);
-                    float loss = computeMSE(scratch_, ringN_, m_, p, phase);
+                    float loss = computeMSE(scratch_, ringN_, m_, p, phase, seasonScratch_);
                     if (loss < bestMSE - 1e-6f) {
                         bestMSE = loss;
                         bestVal = p[k];
